@@ -365,12 +365,27 @@ var _ = Describe("AppStore (Download Product)", func() {
 			Expect(err).To(MatchError(ContainSubstring("failed to resolve latest iOS version for redownload")))
 		})
 
-		It("does not send an unpinned request when the app is absent from the catalog", func() {
-			mockPlatformClient.EXPECT().Send(gomock.Any()).
-				Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusOK}, nil).Times(4)
+		It("redownloads a licensed build when the app is absent from the storefront", func() {
+			expected := http.Result[downloadResult]{
+				StatusCode: gohttp.StatusOK,
+				Data:       downloadResult{Items: []downloadItemResult{{URL: "https://example.com/licensed.ipa"}}},
+			}
+			gomock.InOrder(
+				mockPlatformClient.EXPECT().Send(gomock.Any()).
+					Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusOK}, nil).Times(3),
+				mockPlatformClient.EXPECT().Send(gomock.Any()).
+					Return(http.Result[platformVersionLookupResult]{StatusCode: gohttp.StatusNotFound}, nil),
+				mockDownloadClient.EXPECT().Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.URL).To(Equal(testRedownloadEndpoint + "?guid=" + testGUID))
+						Expect(req.Payload.(*http.XMLPayload).Content).ToNot(HaveKey("appExtVrsId"))
+					}).Return(expected, nil),
+			)
 
-			_, _, err := store.sendDownloadProduct(context.Background(), account, app, testGUID, "", PlatformIPhone)
-			Expect(err).To(MatchError(ContainSubstring("platform version lookup returned no app")))
+			actual, resolvedPlatform, err := store.sendDownloadProduct(context.Background(), account, app, testGUID, "", PlatformIPhone)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(actual).To(Equal(expected))
+			Expect(resolvedPlatform).To(Equal(PlatformIPhone))
 		})
 
 		It("does not send an unpinned request when the catalog version is missing", func() {

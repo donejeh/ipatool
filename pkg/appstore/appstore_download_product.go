@@ -99,14 +99,22 @@ func (t *appstore) sendDownloadProduct(ctx context.Context, acc Account, app App
 
 	if externalVersionID == "" && (platform == "" || platform == PlatformIPhone || platform == PlatformIPad) {
 		// Unpinned redownloads can fail or return a tvOS package. Select
-		// the current iOS build before sending.
+		// the current iOS build before sending when the storefront still
+		// lists it.
 		if platform == "" {
 			platform = PlatformIPhone
 		}
 
-		externalVersionID, err = t.lookupLatestExternalVersionID(acc, app, platform)
-		if err != nil {
-			return res, platform, fmt.Errorf("failed to resolve latest iOS version for redownload: %w", err)
+		resolvedVersionID, lookupErr := t.lookupLatestExternalVersionID(acc, app, platform)
+		if lookupErr != nil {
+			// A purchased app can leave the account's storefront and still be
+			// licensed for redownload. Continue without a catalog pin and let
+			// package validation reject a build for the wrong platform.
+			if !errors.Is(lookupErr, errPlatformAppNotFound) && !errors.Is(lookupErr, errPlatformOffersNotFound) {
+				return res, platform, fmt.Errorf("failed to resolve latest iOS version for redownload: %w", lookupErr)
+			}
+		} else {
+			externalVersionID = resolvedVersionID
 		}
 	}
 

@@ -173,6 +173,9 @@ func (*appstore) validatePackagePlatform(path string, platform Platform) error {
 	}
 	defer reader.Close()
 
+	sawInfoPlist := false
+	sawDeclaredPlatform := false
+
 	for _, file := range reader.File {
 		if !isTopLevelAppInfoPlist(file.Name) {
 			continue
@@ -201,11 +204,31 @@ func (*appstore) validatePackagePlatform(path string, platform Platform) error {
 			return fmt.Errorf("failed to decode info plist: %w", err)
 		}
 
+		sawInfoPlist = true
+		declaredPlatform := false
+
 		for _, supportedPlatform := range info.SupportedPlatforms {
-			if supportedPlatform == expectedPlatform {
+			if supportedPlatform == "" {
+				continue
+			}
+
+			declaredPlatform = true
+
+			if strings.EqualFold(supportedPlatform, expectedPlatform) {
 				return nil
 			}
 		}
+
+		if declaredPlatform {
+			sawDeclaredPlatform = true
+		}
+	}
+
+	// Older iOS apps predate CFBundleSupportedPlatforms. Keep those packages
+	// when they simply omit a declaration. A conflicting declaration, such as
+	// AppleTVOS, is still rejected above.
+	if sawInfoPlist && !sawDeclaredPlatform && expectedPlatform == "iPhoneOS" {
+		return nil
 	}
 
 	return fmt.Errorf("downloaded package does not declare %s support", expectedPlatform)

@@ -1148,10 +1148,33 @@ var _ = Describe("AppStore (Download)", func() {
 			},
 			Entry("iPhone accepts iPhoneOS", PlatformIPhone, []string{"iPhoneOS"}, true),
 			Entry("iPad accepts iPhoneOS", PlatformIPad, []string{"iPhoneOS"}, true),
+			Entry("iPhone accepts a lowercase declaration", PlatformIPhone, []string{"iphoneos"}, true),
 			Entry("iPhone rejects AppleTVOS", PlatformIPhone, []string{"AppleTVOS"}, false),
 			Entry("iPad rejects XROS", PlatformIPad, []string{"XROS"}, false),
-			Entry("missing platform declaration", PlatformIPhone, []string{}, false),
+			Entry("missing platform declaration", PlatformIPhone, []string{}, true),
 		)
+
+		It("accepts a legacy iPhone package that omits CFBundleSupportedPlatforms", func() {
+			file, err := os.CreateTemp("", "ipatool-legacy-*.ipa")
+			Expect(err).ToNot(HaveOccurred())
+			defer os.Remove(file.Name())
+
+			zipFile := zip.NewWriter(file)
+			writer, err := zipFile.Create("Payload/Test.app/Info.plist")
+			Expect(err).ToNot(HaveOccurred())
+			info, err := plist.Marshal(map[string]interface{}{
+				"CFBundleExecutable": "Test",
+				"LSRequiresIPhoneOS": true,
+			}, plist.BinaryFormat)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = writer.Write(info)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(zipFile.Close()).To(Succeed())
+			Expect(file.Close()).To(Succeed())
+
+			Expect((&appstore{}).validatePackagePlatform(file.Name(), PlatformIPhone)).To(Succeed())
+			Expect((&appstore{}).validatePackagePlatform(file.Name(), PlatformAppleTV)).To(HaveOccurred())
+		})
 
 		It("does not accept iOS support declared only by an embedded app", func() {
 			path := writePackageWithInfoPlists(map[string][]string{

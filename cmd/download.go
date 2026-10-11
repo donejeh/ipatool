@@ -2,7 +2,12 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -20,6 +25,7 @@ func downloadCmd() *cobra.Command {
 func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	var (
 		acquireLicense    bool
+		dryRun            bool
 		outputPath        string
 		appID             int64
 		bundleID          string
@@ -47,6 +53,41 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 			}
 
 			acc := infoResult.Account
+
+			if dryRun {
+				app, err := resolveDownloadApp(store, acc, appID, bundleID, platform)
+				if err != nil {
+					return err
+				}
+
+				destination, err := dryRunDestination(app, externalVersionID, outputPath, platform)
+				if err != nil {
+					return err
+				}
+
+				version := externalVersionID
+				if version == "" {
+					version = "latest"
+				}
+
+				displayedPlatform := platform
+				if displayedPlatform == "" {
+					displayedPlatform = appstore.PlatformIPhone
+				}
+
+				dependencies.Logger.Log().
+					Bool("dry_run", true).
+					Int64("app_id", app.ID).
+					Str("bundle_id", app.BundleID).
+					Str("platform", string(displayedPlatform)).
+					Str("version", version).
+					Str("output", destination).
+					Bool("success", true).
+					Msg("no download performed")
+
+				return nil
+			}
+
 			var lastErr error
 			purchaseRequired := false
 			purchased := false
@@ -64,22 +105,9 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 					acc = loginResult.Account
 				}
 
-				app := appstore.App{ID: appID, BundleID: bundleID}
-
-				if bundleID != "" {
-					lookupResult, err := store.Lookup(appstore.LookupInput{
-						Account:  acc,
-						BundleID: bundleID,
-						Platform: platform,
-					})
-					if err != nil && (appID == 0 || !errors.Is(err, appstore.ErrAppNotFound)) {
-						return err
-					}
-
-					// Delisted apps may still be downloadable by their numeric ID.
-					if err == nil {
-						app = lookupResult.App
-					}
+				app, err := resolveDownloadApp(store, acc, appID, bundleID, platform)
+				if err != nil {
+					return err
 				}
 
 				if errors.Is(lastErr, appstore.ErrLicenseRequired) {
@@ -105,20 +133,7 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 				interactive, _ := cmd.Context().Value(interactiveKey).(bool)
 				var progress *progressbar.ProgressBar
 				if interactive {
-					progress = progressbar.NewOptions64(1,
-						progressbar.OptionSetDescription("downloading"),
-						progressbar.OptionSetWriter(os.Stdout),
-						progressbar.OptionShowBytes(true),
-						progressbar.OptionSetWidth(20),
-						progressbar.OptionFullWidth(),
-						progressbar.OptionThrottle(65*time.Millisecond),
-						progressbar.OptionShowCount(),
-						progressbar.OptionClearOnFinish(),
-						progressbar.OptionSpinnerType(14),
-						progressbar.OptionSetRenderBlankState(true),
-						progressbar.OptionSetElapsedTime(false),
-						progressbar.OptionSetPredictTime(false),
-					)
+					progress = newDownloadProgressBar(os.Stdout)
 				}
 
 				out, err := store.Download(appstore.DownloadInput{
@@ -173,8 +188,111 @@ func downloadCmdWithAppStore(appStore func() appstore.AppStore) *cobra.Command {
 	cmd.Flags().StringVar(&externalVersionID, "external-version-id", "", "External version identifier of the target app (defaults to latest version when not specified)")
 	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to download for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
 	cmd.Flags().BoolVar(&acquireLicense, "purchase", false, "Obtain a license for the app if needed")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Resolve the app, version, and output path without purchasing or downloading")
 
 	return cmd
+}
+
+func resolveDownloadApp(store appstore.AppStore, acc appstore.Account, appID int64, bundleID string, platform appstore.Platform) (appstore.App, error) {
+	app := appstore.App{ID: appID, BundleID: bundleID}
+	if bundleID == "" {
+		return app, nil
+	}
+
+	lookupResult, err := store.Lookup(appstore.LookupInput{
+		Account:  acc,
+		BundleID: bundleID,
+		Platform: platform,
+	})
+	if err != nil && (appID == 0 || !errors.Is(err, appstore.ErrAppNotFound)) {
+		return appstore.App{}, err
+	}
+
+	// Delisted apps may still be downloadable by their numeric ID.
+	if err == nil {
+		app = lookupResult.App
+	}
+
+	return app, nil
+}
+
+func dryRunDestination(app appstore.App, externalVersionID, outputPath string, platform appstore.Platform) (string, error) {
+	version := externalVersionID
+	if version == "" {
+		version = "latest"
+	}
+
+	fileName := downloadPackageFileName(app, version, platform)
+	if outputPath == "" {
+		workdir, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get current directory: %w", err)
+		}
+
+		return filepath.Join(workdir, fileName), nil
+	}
+
+	info, err := os.Stat(outputPath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to determine whether path is a directory: %w", err)
+	}
+
+	if err == nil && info.IsDir() {
+		return filepath.Join(outputPath, fileName), nil
+	}
+
+	return outputPath, nil
+}
+
+func downloadPackageFileName(app appstore.App, version string, platform appstore.Platform) string {
+	var parts []string
+
+	if app.BundleID != "" {
+		parts = append(parts, app.BundleID)
+	}
+
+	if app.ID != 0 {
+		parts = append(parts, strconv.FormatInt(app.ID, 10))
+	}
+
+	if version != "" {
+		parts = append(parts, version)
+	}
+
+	extension := "ipa"
+	if platform == appstore.PlatformMacOS {
+		extension = "pkg"
+	}
+
+	return strings.Join(parts, "_") + "." + extension
+}
+
+// newDownloadProgressBar renders a single-line ASCII bar.
+// Full-width Unicode blocks wrap in macOS terminals, and the following
+// carriage return then paints the next update on a blank line.
+func newDownloadProgressBar(writer io.Writer) *progressbar.ProgressBar {
+	if writer == nil {
+		writer = os.Stdout
+	}
+
+	return progressbar.NewOptions64(1,
+		progressbar.OptionSetDescription("downloading"),
+		progressbar.OptionSetWriter(writer),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowTotalBytes(true),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetTheme(progressbar.ThemeASCII),
+		progressbar.OptionUseANSICodes(true),
+		progressbar.OptionSpinnerType(9),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(writer, "\n")
+		}),
+	)
 }
 
 type sinfReplicator interface {

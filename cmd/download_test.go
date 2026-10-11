@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/majd/ipatool/v2/pkg/appstore"
 	"github.com/majd/ipatool/v2/pkg/log"
@@ -78,6 +80,97 @@ var _ = Describe("Download command", func() {
 	It("exposes macOS in platform help", func() {
 		cmd := downloadCmd()
 		Expect(cmd.Flag("platform").Usage).To(ContainSubstring("macos"))
+		Expect(cmd.Flag("dry-run").Usage).To(ContainSubstring("without purchasing or downloading"))
+	})
+
+	Describe("dry run", func() {
+		var (
+			store *fakeDownloadAppStore
+			logs  bytes.Buffer
+		)
+
+		BeforeEach(func() {
+			store = &fakeDownloadAppStore{account: appstore.Account{StoreFront: "143441"}}
+			logs.Reset()
+			previousDependencies := dependencies
+			DeferCleanup(func() { dependencies = previousDependencies })
+			dependencies.Logger = log.NewLogger(log.Args{Writer: &logs})
+		})
+
+		execute := func(args ...string) error {
+			cmd := downloadCmdWithAppStore(func() appstore.AppStore { return store })
+			cmd.SetArgs(args)
+			cmd.SetContext(context.WithValue(context.Background(), interactiveKey, true))
+
+			return cmd.Execute()
+		}
+
+		It("resolves the destination without purchasing or downloading", func() {
+			directory := GinkgoT().TempDir()
+			Expect(execute("--app-id", "42", "--dry-run", "--purchase", "--platform", "iphone", "--external-version-id", "99", "--output", directory)).To(Succeed())
+			Expect(store.accountInfoCalls).To(Equal(1))
+			Expect(store.lookupInputs).To(BeEmpty())
+			Expect(store.purchaseInputs).To(BeEmpty())
+			Expect(store.downloadInputs).To(BeEmpty())
+			Expect(logs.String()).To(ContainSubstring(`"dry_run":true`))
+			Expect(logs.String()).To(ContainSubstring(`"app_id":42`))
+			Expect(logs.String()).To(ContainSubstring(`"platform":"iphone"`))
+			Expect(logs.String()).To(ContainSubstring(`"version":"99"`))
+			Expect(logs.String()).To(ContainSubstring(`"success":true`))
+			Expect(logs.String()).To(ContainSubstring("no download performed"))
+			Expect(logs.String()).To(ContainSubstring(filepath.Join(directory, "42_99.ipa")))
+		})
+
+		It("uses the latest version and the iPhone platform when they are omitted", func() {
+			Expect(execute("--app-id", "42", "--dry-run")).To(Succeed())
+			Expect(store.downloadInputs).To(BeEmpty())
+			Expect(logs.String()).To(ContainSubstring(`"platform":"iphone"`))
+			Expect(logs.String()).To(ContainSubstring(`"version":"latest"`))
+			Expect(logs.String()).To(ContainSubstring("42_latest.ipa"))
+		})
+
+		It("resolves a bundle identifier and does not download", func() {
+			store.lookupOutput.App = appstore.App{ID: 43, BundleID: "com.example.listed"}
+			Expect(execute("--bundle-identifier", "com.example.listed", "--dry-run", "--platform", "macos")).To(Succeed())
+			Expect(store.lookupInputs).To(HaveLen(1))
+			Expect(store.downloadInputs).To(BeEmpty())
+			Expect(store.purchaseInputs).To(BeEmpty())
+			Expect(logs.String()).To(ContainSubstring(`"app_id":43`))
+			Expect(logs.String()).To(ContainSubstring(`"bundle_id":"com.example.listed"`))
+			Expect(logs.String()).To(ContainSubstring("com.example.listed_43_latest.pkg"))
+		})
+
+		It("keeps a numeric app ID when the bundle is delisted", func() {
+			store.lookupError = fmt.Errorf("lookup: %w", appstore.ErrAppNotFound)
+			Expect(execute("--app-id", "42", "--bundle-identifier", "com.example.delisted", "--dry-run")).To(Succeed())
+			Expect(store.downloadInputs).To(BeEmpty())
+			Expect(logs.String()).To(ContainSubstring(`"app_id":42`))
+			Expect(logs.String()).To(ContainSubstring(`"bundle_id":"com.example.delisted"`))
+		})
+
+		It("returns lookup failures without downloading", func() {
+			store.lookupError = errors.New("request failed")
+			Expect(execute("--app-id", "42", "--bundle-identifier", "com.example.app", "--dry-run")).To(MatchError("request failed"))
+			Expect(store.downloadInputs).To(BeEmpty())
+			Expect(store.purchaseInputs).To(BeEmpty())
+		})
+	})
+
+	It("renders a single-line ASCII download progress bar", func() {
+		var output bytes.Buffer
+		bar := newDownloadProgressBar(&output)
+		Expect(bar.Add(1)).To(Succeed())
+
+		rendered := output.String()
+		Expect(rendered).To(ContainSubstring("downloading"))
+		Expect(rendered).To(ContainSubstring("%"))
+		Expect(rendered).To(ContainSubstring("["))
+		Expect(rendered).ToNot(ContainSubstring("█"))
+		Expect(rendered).To(ContainSubstring("\x1b[0K"))
+		Expect(rendered).To(ContainSubstring("\n"))
+		for _, line := range bytes.Split(output.Bytes(), []byte("\n")) {
+			Expect(len(line)).To(BeNumerically("<", 240))
+		}
 	})
 
 	It("skips sinf replication for macOS packages", func() {
